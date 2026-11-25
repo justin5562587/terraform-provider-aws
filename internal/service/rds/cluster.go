@@ -749,8 +749,58 @@ func resourceCluster() *schema.Resource {
 				}
 				return nil
 			},
+			validateServerlessV2MaxCapacity,
 		),
 	}
+}
+
+// serverlessV2StaticMaxCapacity is the highest max_capacity accepted by every Aurora
+// Serverless v2 platform version. Larger values depend on the engine version.
+const serverlessV2StaticMaxCapacity = 256
+
+// validateServerlessV2MaxCapacity rejects a serverlessv2_scaling_configuration max_capacity
+// above what the configured engine version supports, as reported by RDS. This is best effort:
+// when the engine version is unknown, partial or cannot be looked up, validation is left to RDS.
+func validateServerlessV2MaxCapacity(ctx context.Context, diff *schema.ResourceDiff, meta any) error {
+	const maxCapacityKey = "serverlessv2_scaling_configuration.0.max_capacity"
+
+	if !diff.NewValueKnown(maxCapacityKey) || !diff.NewValueKnown(names.AttrEngine) || !diff.NewValueKnown(names.AttrEngineVersion) {
+		return nil
+	}
+
+	maxCapacity, ok := diff.Get(maxCapacityKey).(float64)
+	if !ok || maxCapacity <= serverlessV2StaticMaxCapacity {
+		return nil
+	}
+
+	engine, engineVersion := diff.Get(names.AttrEngine).(string), diff.Get(names.AttrEngineVersion).(string)
+	if engine == "" || engineVersion == "" {
+		return nil
+	}
+
+	conn := meta.(*conns.AWSClient).RDSClient(ctx)
+	output, err := findDBEngineVersion(ctx, conn, &rds.DescribeDBEngineVersionsInput{
+		Engine:        aws.String(engine),
+		EngineVersion: aws.String(engineVersion),
+	}, tfslices.PredicateTrue[*types.DBEngineVersion]())
+	if err != nil {
+		// Partial versions (e.g. "17"), unavailable versions or missing permissions.
+		return nil
+	}
+
+	return checkServerlessV2MaxCapacity(maxCapacity, engine, engineVersion, output.ServerlessV2FeaturesSupport)
+}
+
+func checkServerlessV2MaxCapacity(maxCapacity float64, engine, engineVersion string, support *types.ServerlessV2FeaturesSupport) error {
+	if support == nil || support.MaxCapacity == nil {
+		return nil
+	}
+
+	if supported := aws.ToFloat64(support.MaxCapacity); maxCapacity > supported {
+		return fmt.Errorf("serverlessv2_scaling_configuration.0.max_capacity (%g) exceeds the maximum of %g ACUs supported by %s %s", maxCapacity, supported, engine, engineVersion)
+	}
+
+	return nil
 }
 
 func resourceClusterCreate(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
